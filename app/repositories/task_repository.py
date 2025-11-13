@@ -53,98 +53,101 @@ class TaskRepository(BaseRepository):
             logger.error(traceback.format_exc())
             raise
 
+
+
     async def find_with_filters(
-            self,
-            category_id: Optional[str] = None,
-            tag_id: Optional[str] = None,
-            search: Optional[str] = None,
-            limit: int = 20,
-            cursor: Optional[str] = None
-    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
-        """Find tasks with filters and error handling"""
-        try:
-            query = {"deleted": False}
+                self,
+                category_id: Optional[str] = None,
+                tag_id: Optional[str] = None,
+                search: Optional[str] = None,
+                limit: int = 20,
+                cursor: Optional[str] = None
+        ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+            """Find tasks with filters, search, and cursor-based pagination."""
+            try:
+                query: Dict[str, Any] = {"deleted": False}
 
-            # Handle cursor pagination
-            if cursor:
-                try:
-                    cursor_data = json.loads(base64.b64decode(cursor).decode())
-                    query["created_at"] = {"$lt": datetime.fromisoformat(cursor_data["created_at"])}
-                except Exception as e:
-                    logger.warning(f"Invalid cursor: {cursor}")
+                # 1️⃣ Cursor-based pagination
+                if cursor:
+                    try:
+                        cursor_data = json.loads(base64.b64decode(cursor).decode())
+                        cursor_date = datetime.fromisoformat(cursor_data["created_at"])
+                        query["created_at"] = {"$lt": cursor_date}
+                    except Exception:
+                        logger.warning(f"Invalid cursor: {cursor}")
 
-            # Handle search
-            if search:
-                query["$or"] = [
-                    {"title": {"$regex": search, "$options": "i"}},
-                    {"description": {"$regex": search, "$options": "i"}}
-                ]
+                # 2️⃣ Keyword search
+                if search:
+                    query["$or"] = [
+                        {"title": {"$regex": search, "$options": "i"}},
+                        {"description": {"$regex": search, "$options": "i"}}
+                    ]
 
-            # Handle category and tag filters
-            task_ids = None
+                # 3️⃣ Filter by category/tag relationships
+                task_ids: Optional[set] = None
 
-            if category_id:
-                cat_relationships = await self.tasks_categories.find(
-                    {"category_id": category_id}
-                ).to_list(length=None)
-                task_ids = {rel["task_id"] for rel in cat_relationships}
+                if category_id:
+                    cat_relationships = await self.tasks_categories.find(
+                        {"category_id": category_id}
+                    ).to_list(length=None)
 
-                # Early return if no tasks found for this category
-                if not task_ids:  # Empty set
-                    logger.info(f"No tasks found for category {category_id}")
-                    return [], None
-
-            if tag_id:
-                tag_relationships = await self.tasks_tags.find(
-                    {"tag_id": tag_id}
-                ).to_list(length=None)
-                tag_task_ids = {rel["task_id"] for rel in tag_relationships}
-
-                # Early return if no tasks found for this tag
-                if not tag_task_ids:  # Empty set
-                    logger.info(f"No tasks found for tag {tag_id}")
-                    return [], None
-
-                # Handle intersection
-                if task_ids is not None:
-                    task_ids = task_ids.intersection(tag_task_ids)
-                    # Early return if intersection is empty
-                    if not task_ids:  # Empty set
-                        logger.info(f"No tasks found matching both category and tag")
+                    cat_task_ids = {rel["task_id"] for rel in cat_relationships}
+                    if not cat_task_ids:
+                        logger.info(f"No tasks found for category {category_id}")
                         return [], None
-                else:
-                    task_ids = tag_task_ids
 
-            # Apply task_ids filter only if we have valid IDs
-            if task_ids is not None:
-                # Double check it's not empty before adding to query
-                if not task_ids:  # Empty set
-                    logger.info("No tasks match the filters")
-                    return [], None
-                query["_id"] = {"$in": list(task_ids)}
+                    task_ids = cat_task_ids
 
-            # Execute query
-            tasks = await self.collection.find(query).sort(
-                "created_at", -1
-            ).limit(limit + 1).to_list(length=limit + 1)
+                if tag_id:
+                    tag_relationships = await self.tasks_tags.find(
+                        {"tag_id": tag_id}
+                    ).to_list(length=None)
 
-            # Handle pagination cursor
-            next_cursor = None
-            if len(tasks) > limit:
-                tasks = tasks[:limit]
-                last_task = tasks[-1]
-                cursor_data = {"created_at": last_task["created_at"].isoformat()}
-                next_cursor = base64.b64encode(
-                    json.dumps(cursor_data).encode()
-                ).decode()
+                    tag_task_ids = {rel["task_id"] for rel in tag_relationships}
+                    if not tag_task_ids:
+                        logger.info(f"No tasks found for tag {tag_id}")
+                        return [], None
 
-            logger.info(f"Found {len(tasks)} tasks")
-            return tasks, next_cursor
+                    # If both filters exist, intersect sets
+                    if task_ids is not None:
+                        task_ids &= tag_task_ids
+                        if not task_ids:
+                            logger.info("No tasks match both category and tag filters")
+                            return [], None
+                    else:
+                        task_ids = tag_task_ids
 
-        except Exception as e:
-            logger.error(f"Error finding tasks: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
+                # 4️⃣ Apply filtered task IDs to query
+                if task_ids is not None:
+                    if not task_ids:
+                        logger.info("No matching task IDs after filtering")
+                        return [], None
+                    query["_id"] = {"$in": list(task_ids)}
+
+                # 5️⃣ Query tasks collection
+                tasks = await self.collection.find(query).sort(
+                    "created_at", -1
+                ).limit(limit + 1).to_list(length=limit + 1)
+
+                # 6️⃣ Generate next cursor
+                next_cursor = None
+                if len(tasks) > limit:
+                    tasks = tasks[:limit]
+                    last_task = tasks[-1]
+                    created_at = last_task.get("created_at")
+                    if created_at:
+                        cursor_data = {"created_at": created_at.isoformat()}
+                        next_cursor = base64.b64encode(
+                            json.dumps(cursor_data).encode()
+                        ).decode()
+
+                logger.info(f"Found {len(tasks)} tasks (next_cursor={next_cursor})")
+                return tasks, next_cursor
+
+            except Exception as e:
+                logger.error(f"Error finding tasks: {e}")
+                logger.debug(traceback.format_exc())
+                raise
 
     async def get_categories_for_task(self, task_id: str) -> List[str]:
         """Get categories for task with error handling"""
@@ -182,16 +185,45 @@ class TaskRepository(BaseRepository):
             raise
 
     async def soft_delete(self, task_id: str) -> bool:
-        """Soft delete task with error handling"""
+        """Soft delete a task (mark deleted=True) with detailed logging"""
         try:
+            # Always ensure string type
+            task_id = str(task_id).strip()
+            logger.info(f"Attempting to soft delete task: '{task_id}'")
+
+            # Step 1: Check if the task exists
+            existing_task = await self.collection.find_one({"_id": task_id})
+            if not existing_task:
+                logger.warning(f"No task found with _id='{task_id}'")
+                return False
+
+            logger.info(f"Found task: {existing_task}")
+
+            # Step 2: Check if already deleted
+            if existing_task.get("deleted", False):
+                logger.warning(f"Task '{task_id}' is already deleted")
+                return False
+
+            # Step 3: Perform soft delete
             result = await self.collection.update_one(
                 {"_id": task_id},
                 {"$set": {"deleted": True, "updated_at": datetime.utcnow()}}
             )
-            if result.modified_count > 0:
-                logger.info(f"Task {task_id} soft deleted")
-            return result.modified_count > 0
+
+            # Step 4: Verify update result
+            if result.modified_count == 1:
+                logger.info(f"Task '{task_id}' soft deleted successfully")
+                return True
+            else:
+                logger.warning(
+                    f"Task '{task_id}' matched but not modified. "
+                    f"matched_count={result.matched_count}, modified_count={result.modified_count}"
+                )
+                updated = await self.collection.find_one({"_id": task_id})
+                logger.debug(f"Task after update attempt: {updated}")
+                return False
+
         except Exception as e:
-            logger.error(f"Error soft deleting task {task_id}: {str(e)}")
+            logger.error(f"Error soft deleting task '{task_id}': {e}")
             logger.error(traceback.format_exc())
             raise
